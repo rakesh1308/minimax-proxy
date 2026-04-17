@@ -1,12 +1,22 @@
 # minimax_proxy.py - Minimax Token Plan Proxy with proper OpenAI streaming
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import re
 import json
 import os
 
 app = FastAPI()
+
+# Add CORS middleware to allow requests from any origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configuration - Set these in Zeabur environment variables
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "sk-cp-xxxxxxxxxxxx")
@@ -123,10 +133,14 @@ async def stream_minimax_response(response: httpx.Response):
 @app.post("/v1/chat/completions")
 async def proxy_minimax(request: Request):
     """Proxy requests to Minimax Token Plan API"""
+    # Log incoming request for debugging
+    print(f"Received request to /v1/chat/completions")
+    
     data = await request.json()
     
     # Check if streaming is requested
     is_streaming = data.get("stream", False)
+    print(f"Streaming: {is_streaming}, Model: {data.get('model', 'unknown')}")
     
     headers = {
         "Authorization": f"Bearer {MINIMAX_API_KEY}",
@@ -144,40 +158,49 @@ async def proxy_minimax(request: Request):
         if param in data:
             del data[param]
     
-    async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
-        response = await client.post(
-            "https://api.minimax.io/v1/chat/completions",
-            json=data,
-            headers=headers,
-            follow_redirects=True
-        )
-        
-        if is_streaming:
-            return StreamingResponse(
-                stream_minimax_response(response),
-                media_type="text/event-stream"
+    try:
+        async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
+            response = await client.post(
+                "https://api.minimax.io/v1/chat/completions",
+                json=data,
+                headers=headers,
+                follow_redirects=True
             )
-        else:
-            # Handle non-streaming responses
-            result = response.json()
             
-            if 'choices' in result and len(result['choices']) > 0:
-                message = result['choices'][0].get('message', {})
-                content = message.get('content', '')
-                
-                if content:
-                    cleaned_content = clean_content(content)
-                    if cleaned_content != content:
-                        message['content'] = cleaned_content
-                        result['choices'][0]['message'] = message
-                
-                # Handle reasoning_details in non-streaming
-                reasoning_details = message.get('reasoning_details', [])
-                if reasoning_details and isinstance(reasoning_details, list):
-                    # Keep reasoning separate, don't merge into content
-                    pass
+            print(f"Minimax API response status: {response.status_code}")
             
-            return result
+            if is_streaming:
+                return StreamingResponse(
+                    stream_minimax_response(response),
+                    media_type="text/event-stream"
+                )
+            else:
+                # Handle non-streaming responses
+                result = response.json()
+                
+                if 'choices' in result and len(result['choices']) > 0:
+                    message = result['choices'][0].get('message', {})
+                    content = message.get('content', '')
+                    
+                    if content:
+                        cleaned_content = clean_content(content)
+                        if cleaned_content != content:
+                            message['content'] = cleaned_content
+                            result['choices'][0]['message'] = message
+                    
+                    # Handle reasoning_details in non-streaming
+                    reasoning_details = message.get('reasoning_details', [])
+                    if reasoning_details and isinstance(reasoning_details, list):
+                        # Keep reasoning separate, don't merge into content
+                        pass
+                
+                return result
+    except Exception as e:
+        print(f"Error proxying request: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 
 @app.get("/health")
@@ -194,6 +217,16 @@ async def root():
             "GET /health": "Health check",
             "GET /": "This info page"
         }
+    }
+
+
+@app.get("/test")
+async def test_endpoint():
+    """Test endpoint to verify proxy is working"""
+    return {
+        "status": "ok",
+        "message": "Proxy is accessible",
+        "api_key_configured": MINIMAX_API_KEY != "sk-cp-xxxxxxxxxxxx"
     }
 
 
