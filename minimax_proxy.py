@@ -1,4 +1,4 @@
-# minimax_proxy.py - Minimal working proxy for Minimax Token Plan
+# minimax_proxy.py - Minimax Token Plan Proxy with proper OpenAI streaming
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import httpx
@@ -10,30 +10,31 @@ app = FastAPI()
 
 # Configuration - Set these in Zeabur environment variables
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "sk-cp-xxxxxxxxxxxx")
-PROXY_TIMEOUT = 60.0
+PROXY_TIMEOUT = 120.0
 
 
-def clean_thinking_blocks(content: str) -> str:
-    """Remove thinking blocks and fix parameter format"""
+def clean_content(content: str) -> str:
+    """Clean content by removing <think>... thinking tags"""
     if not content:
         return content
     
-    # Remove thinking blocks - be careful with nested tags
     result = content
     
-    # Use a simpler approach that works better with streaming
-    # Match <thinking>...</thinking> tags (case-insensitive)
+    # Remove <think>... tags (MiniMax uses these in OpenAI format)
+    result = re.sub(r'<think>[\s\S]*?', '', result)
+    
+    # Also handle any <thinking>...</thinking> tags (for compatibility)
     thinking_pattern = re.compile(r'<thinking>[\s\S]*?</thinking>', re.IGNORECASE)
     result = thinking_pattern.sub('', result)
     
     # Fix parameter format: <parameter name="x"> to <parameter=x>
     result = re.sub(r'<parameter name="([^"]+)">', r'<parameter=\1>', result)
     
-    return result
+    return result.strip()
 
 
-async def clean_minimax_stream(response: httpx.Response):
-    """Clean thinking blocks from Minimax streaming response"""
+async def stream_minimax_response(response: httpx.Response):
+    """Stream MiniMax response, properly handling reasoning_content and content"""
     buffer = ""
     
     async for chunk in response.aiter_bytes():
@@ -63,44 +64,54 @@ async def clean_minimax_stream(response: httpx.Response):
                     yield b'data: [DONE]\n\n'
                     continue
                 
-                # Try to parse and clean the JSON
                 try:
                     data = json.loads(data_str)
                     
                     if 'choices' in data and len(data['choices']) > 0:
                         choice = data['choices'][0]
+                        delta = choice.get('delta', {})
                         
-                        # Handle delta content in streaming
-                        if 'delta' in choice:
-                            delta = choice.get('delta', {})
-                            content = delta.get('content', '')
-                            
-                            if content:
-                                cleaned_content = clean_thinking_blocks(content)
-                                if cleaned_content != content:
-                                    delta['content'] = cleaned_content
-                                    choice['delta'] = delta
-                                    yield f'data: {json.dumps(data, ensure_ascii=False)}\n\n'.encode()
-                                    continue
+                        # Handle reasoning_content (MiniMax's thinking in OpenAI format)
+                        reasoning_content = delta.get('reasoning_content', '')
+                        if reasoning_content:
+                            # Create a reasoning chunk
+                            reasoning_delta = {
+                                "role": "assistant",
+                                "reasoning_content": reasoning_content
+                            }
+                            reasoning_data = {
+                                "id": data.get("id", ""),
+                                "object": "chat.completion.chunk",
+                                "created": data.get("created", 0),
+                                "model": data.get("model", ""),
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": reasoning_delta,
+                                    "finish_reason": None
+                                }]
+                            }
+                            yield f'data: {json.dumps(reasoning_data, ensure_ascii=False)}\n\n'.encode()
                         
-                        # Handle message content in non-streaming format
-                        elif 'message' in choice:
-                            message = choice.get('message', {})
-                            content = message.get('content', '')
+                        # Handle regular content
+                        content = delta.get('content', '')
+                        if content:
+                            # Clean content (remove <think> tags)
+                            cleaned_content = clean_content(content)
                             
-                            if content:
-                                cleaned_content = clean_thinking_blocks(content)
-                                if cleaned_content != content:
-                                    message['content'] = cleaned_content
-                                    choice['message'] = message
-                                    yield f'data: {json.dumps(data, ensure_ascii=False)}\n\n'.encode()
-                                    continue
-                    
-                    # Pass through unchanged
-                    yield f'data: {data_str}\n\n'.encode()
-                    
+                            if cleaned_content:
+                                delta['content'] = cleaned_content
+                                choice['delta'] = delta
+                                yield f'data: {json.dumps(data, ensure_ascii=False)}\n\n'.encode()
+                                continue
+                        
+                        # If no content after cleaning, just pass through
+                        if not reasoning_content:
+                            yield f'data: {data_str}\n\n'.encode()
+                    else:
+                        # Pass through non-choice data (like usage stats at end)
+                        yield f'data: {data_str}\n\n'.encode()
+                        
                 except json.JSONDecodeError:
-                    # Pass through non-JSON data as-is
                     yield f'data: {data_str}\n\n'.encode()
     
     # Yield any remaining buffer content
@@ -114,26 +125,24 @@ async def proxy_minimax(request: Request):
     """Proxy requests to Minimax Token Plan API"""
     data = await request.json()
     
+    # Check if streaming is requested
+    is_streaming = data.get("stream", False)
+    
     headers = {
         "Authorization": f"Bearer {MINIMAX_API_KEY}",
         "Content-Type": "application/json",
     }
     
-    # Set accept header based on streaming
-    if data.get("stream", False):
+    if is_streaming:
         headers["Accept"] = "text/event-stream"
     else:
         headers["Accept"] = "application/json"
     
     # Remove problematic parameters that might cause issues
-    if "thinking" in data:
-        del data["thinking"]
-    if "reasoning" in data:
-        del data["reasoning"]
-    if "reasoning_level" in data:
-        del data["reasoning_level"]
-    if "extra_params" in data:
-        del data["extra_params"]
+    problem_params = ["thinking", "reasoning", "reasoning_level", "extra_params"]
+    for param in problem_params:
+        if param in data:
+            del data[param]
     
     async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
         response = await client.post(
@@ -143,25 +152,30 @@ async def proxy_minimax(request: Request):
             follow_redirects=True
         )
         
-        if data.get("stream", False):
+        if is_streaming:
             return StreamingResponse(
-                clean_minimax_stream(response),
+                stream_minimax_response(response),
                 media_type="text/event-stream"
             )
         else:
             # Handle non-streaming responses
             result = response.json()
+            
             if 'choices' in result and len(result['choices']) > 0:
                 message = result['choices'][0].get('message', {})
                 content = message.get('content', '')
                 
                 if content:
-                    # Clean thinking blocks from non-streaming response
-                    cleaned_content = clean_thinking_blocks(content)
-                    
+                    cleaned_content = clean_content(content)
                     if cleaned_content != content:
                         message['content'] = cleaned_content
                         result['choices'][0]['message'] = message
+                
+                # Handle reasoning_details in non-streaming
+                reasoning_details = message.get('reasoning_details', [])
+                if reasoning_details and isinstance(reasoning_details, list):
+                    # Keep reasoning separate, don't merge into content
+                    pass
             
             return result
 
