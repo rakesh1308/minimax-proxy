@@ -9,9 +9,9 @@ WORKDIR /app
 # Install mmx-cli globally
 RUN npm install -g mmx-cli
 
-# Copy Python requirements and install
+# Copy Python requirements and install (use --break-system-packages for externally-managed env)
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy application
 COPY minimax_proxy.py .
