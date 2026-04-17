@@ -49,7 +49,6 @@ def is_complete_json_object(line: str) -> bool:
         return False
     try:
         obj = json.loads(line)
-        # Check if it's a complete response object with content field
         if 'content' in obj and 'usage' in obj:
             return True
         return False
@@ -58,104 +57,109 @@ def is_complete_json_object(line: str) -> bool:
 
 
 async def stream_from_process(process, model):
-    """Stream output from mmx-cli process in real-time"""
+    """Stream output from mmx-cli process in real-time with proper buffering"""
     log("Starting real-time stream from mmx-cli")
-    sent_chunks = set()
+    
+    content_buffer = ""
+    last_yield_time = datetime.now()
+    min_chunk_interval = 0.05  # 50ms minimum between chunks
     
     try:
-        # Read stdout line by line as they come
         while True:
             line = await process.stdout.readline()
             if not line:
-                # Check if process has exited
                 if process.returncode is not None:
-                    break
-                await asyncio.sleep(0.01)
-                continue
-            
-            line_str = line.decode('utf-8', errors='replace').strip()
-            if not line_str:
-                continue
-            
-            # Skip complete JSON response objects (they're summaries, not streaming deltas)
-            if is_complete_json_object(line_str):
-                log(f"Skipping complete JSON object (summary)")
-                continue
-            
-            log(f"mmx output: {line_str[:100]}...")
-            
-            # Parse JSON line for streaming chunks
-            if line_str.startswith('{') and not line_str.endswith('}'):
-                # Partial JSON - might be streaming delta
-                try:
-                    data = json.loads(line_str)
-                    
-                    # Check for content in various fields
-                    content = (data.get('content') or data.get('text') or 
-                              data.get('message', {}).get('content', ''))
-                    reasoning = (data.get('reasoning_content') or data.get('thinking') or
-                               data.get('reasoning') or data.get('message', {}).get('reasoning_content', ''))
-                    
-                    chunk_id = data.get('id', f"chatcmpl-{os.urandom(8).hex()}")
-                    created = data.get('created', int(datetime.now().timestamp()))
-                    
-                    # Yield reasoning as thinking
-                    if reasoning and reasoning not in sent_chunks:
-                        sent_chunks.add(reasoning)
+                    # Process finished, flush any remaining content
+                    if content_buffer:
                         chunk = {
-                            "id": chunk_id,
+                            "id": f"chatcmpl-{os.urandom(8).hex()}",
                             "object": "chat.completion.chunk",
-                            "created": created,
+                            "created": int(datetime.now().timestamp()),
                             "model": model,
                             "choices": [{
                                 "index": 0,
-                                "delta": {"content": f"[Thinking] {reasoning}"},
+                                "delta": {"content": content_buffer},
                                 "finish_reason": None
                             }]
                         }
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
-                    
-                    # Yield content
-                    if content and content not in sent_chunks:
-                        sent_chunks.add(content)
-                        cleaned = clean_content(content)
-                        if cleaned:
-                            chunk = {
-                                "id": chunk_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": cleaned},
-                                    "finish_reason": None
-                                }]
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n".encode()
-                            
+                    break
+                await asyncio.sleep(0.01)
+                continue
+            
+            line_str = line.decode('utf-8', errors='replace')
+            if not line_str:
+                continue
+            
+            stripped = line_str.strip()
+            
+            # Skip complete JSON summary objects
+            if is_complete_json_object(stripped):
+                log(f"Skipping complete JSON object (summary)")
+                continue
+            
+            # Skip lines that are JSON fragments without content
+            if stripped.startswith('{') and not stripped.endswith('}'):
+                try:
+                    data = json.loads(stripped)
+                    content = data.get('content') or data.get('text')
+                    if not content:
+                        continue
                 except json.JSONDecodeError:
                     pass
             
-            # Handle plain text lines (streaming content)
-            elif line_str and not line_str.startswith('{') and not line_str.startswith('data:'):
-                # Plain text streaming output
-                cleaned = clean_content(line_str)
-                if cleaned and len(cleaned) > 2:  # Skip very short lines
-                    chunk = {
-                        "id": f"chatcmpl-{os.urandom(8).hex()}",
-                        "object": "chat.completion.chunk",
-                        "created": int(datetime.now().timestamp()),
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": cleaned},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+            # Accumulate content for better formatting
+            content_buffer += line_str
+            content_buffer = content_buffer.strip()
+            
+            # Only yield when we have complete lines and enough time has passed
+            if '\n' in content_buffer:
+                lines = content_buffer.split('\n')
+                content_buffer = lines[-1]  # Keep incomplete line
+                
+                for full_line in lines[:-1]:
+                    full_line = full_line.strip()
+                    if not full_line:
+                        continue
+                    
+                    # Skip JSON summary lines
+                    if is_complete_json_object(full_line):
+                        continue
+                    
+                    cleaned = clean_content(full_line)
+                    if cleaned:
+                        chunk = {
+                            "id": f"chatcmpl-{os.urandom(8).hex()}",
+                            "object": "chat.completion.chunk",
+                            "created": int(datetime.now().timestamp()),
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": cleaned + "\n"},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n".encode()
         
-        # Process finished, wait for any remaining output
+        # Wait for process to complete
         await process.wait()
+        
+        # Flush remaining content
+        if content_buffer.strip():
+            cleaned = clean_content(content_buffer)
+            if cleaned:
+                chunk = {
+                    "id": f"chatcmpl-{os.urandom(8).hex()}",
+                    "object": "chat.completion.chunk",
+                    "created": int(datetime.now().timestamp()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": cleaned},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n".encode()
         
         # Send final chunk
         final_chunk = {
@@ -178,18 +182,13 @@ async def stream_from_process(process, model):
 async def read_stderr(process):
     """Read stderr (reasoning logs) from mmx-cli"""
     try:
-        reasoning_buffer = []
         while True:
             line = await process.stderr.readline()
             if not line:
                 break
             line_str = line.decode('utf-8', errors='replace').strip()
-            if line_str:
-                # Log thinking process
-                if 'Thinking:' in line_str or 'Response:' in line_str:
-                    log(f"mmx thinking: {line_str[:100]}...")
-                else:
-                    reasoning_buffer.append(line_str)
+            if line_str and ('Thinking:' in line_str or 'Response:' in line_str):
+                log(f"mmx thinking: {line_str[:100]}...")
     except Exception as e:
         log(f"Stderr read error: {e}")
 
@@ -207,13 +206,11 @@ async def proxy_minimax(request: Request):
     
     log(f"Stream: {is_streaming}, Model: {model}")
     
-    # Extract messages
     messages = data.get('messages', [])
     
     if not messages:
         return JSONResponse(status_code=400, content={"error": "No messages provided"})
     
-    # Get messages
     user_message = ""
     system_message = ""
     
@@ -233,15 +230,12 @@ async def proxy_minimax(request: Request):
     
     log(f"User message: {user_message[:100]}...")
     
-    # Build mmx command
     model_suffix = model.replace("MiniMax-", "")
     
-    # Build command - use --stream for streaming output
     cmd = ["mmx", "text", "chat", 
            "--message", user_message, 
            "--model", model_suffix]
     
-    # Add --stream flag for streaming
     if is_streaming:
         cmd.append("--stream")
     
@@ -251,11 +245,9 @@ async def proxy_minimax(request: Request):
     log(f"Running: {' '.join(cmd)}")
     
     try:
-        # Set environment with API key
         env = os.environ.copy()
         env["MINIMAX_API_KEY"] = MINIMAX_API_KEY
         
-        # Start process
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -266,7 +258,6 @@ async def proxy_minimax(request: Request):
         log(f"Process started with PID: {process.pid}")
         
         if is_streaming:
-            # Start stderr reader task
             stderr_task = asyncio.create_task(read_stderr(process))
             
             async def generate():
@@ -276,18 +267,15 @@ async def proxy_minimax(request: Request):
             
             return StreamingResponse(generate(), media_type="text/event-stream")
         else:
-            # Non-streaming: collect all output
             stdout_lines = []
             stderr_lines = []
             
-            # Read stdout
             while True:
                 line = await process.stdout.readline()
                 if not line:
                     break
                 stdout_lines.append(line.decode('utf-8', errors='replace').strip())
             
-            # Read stderr
             while True:
                 line = await process.stderr.readline()
                 if not line:
@@ -296,12 +284,6 @@ async def proxy_minimax(request: Request):
             
             await process.wait()
             
-            # Log stderr
-            for line in stderr_lines:
-                if line:
-                    log(f"mmx stderr: {line[:200]}...")
-            
-            # Parse response - skip complete JSON objects
             full_content = ""
             for line in stdout_lines:
                 if is_complete_json_object(line):
@@ -309,8 +291,7 @@ async def proxy_minimax(request: Request):
                 if line.startswith('{'):
                     try:
                         data = json.loads(line)
-                        content = (data.get('content') or data.get('text') or
-                                 data.get('message', {}).get('content', ''))
+                        content = data.get('content') or data.get('text')
                         if content:
                             full_content += content
                     except:
