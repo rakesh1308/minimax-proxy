@@ -6,6 +6,7 @@ import httpx
 import re
 import json
 import os
+from datetime import datetime
 
 app = FastAPI()
 
@@ -21,6 +22,20 @@ app.add_middleware(
 # Configuration - Set these in Zeabur environment variables
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "sk-cp-xxxxxxxxxxxx")
 PROXY_TIMEOUT = 120.0
+
+# MiniMax API endpoints
+# For Token Plan subscription - use this endpoint
+MINIMAX_API_BASE = os.getenv("MINIMAX_API_BASE", "https://api.minimax.io")
+MINIMAX_API_URL = f"{MINIMAX_API_BASE}/v1/chat/completions"
+
+print(f"[{datetime.now()}] MiniMax Proxy starting...")
+print(f"[{datetime.now()}] API Key configured: {MINIMAX_API_KEY != 'sk-cp-xxxxxxxxxxxx'}")
+print(f"[{datetime.now()}] API URL: {MINIMAX_API_URL}")
+
+
+def log_request(msg: str):
+    """Print log message with timestamp"""
+    print(f"[{datetime.now()}] {msg}")
 
 
 def clean_content(content: str) -> str:
@@ -45,7 +60,9 @@ def clean_content(content: str) -> str:
 
 async def stream_minimax_response(response: httpx.Response):
     """Stream MiniMax response, properly handling reasoning_content and content"""
+    log_request("Starting stream response handler")
     buffer = ""
+    chunk_count = 0
     
     async for chunk in response.aiter_bytes():
         if not chunk:
@@ -53,10 +70,12 @@ async def stream_minimax_response(response: httpx.Response):
             
         try:
             chunk_str = chunk.decode('utf-8', errors='replace')
-        except Exception:
+        except Exception as e:
+            log_request(f"Error decoding chunk: {e}")
             continue
             
         buffer += chunk_str
+        chunk_count += 1
         
         # Process complete SSE lines
         while '\n' in buffer:
@@ -71,6 +90,7 @@ async def stream_minimax_response(response: httpx.Response):
                 data_str = line[6:].strip()
                 
                 if data_str == '[DONE]':
+                    log_request(f"Stream completed. Total chunks: {chunk_count}")
                     yield b'data: [DONE]\n\n'
                     continue
                 
@@ -133,14 +153,18 @@ async def stream_minimax_response(response: httpx.Response):
 @app.post("/v1/chat/completions")
 async def proxy_minimax(request: Request):
     """Proxy requests to Minimax Token Plan API"""
-    # Log incoming request for debugging
-    print(f"Received request to /v1/chat/completions")
+    log_request("=" * 50)
+    log_request("RECEIVED REQUEST to /v1/chat/completions")
     
     data = await request.json()
     
     # Check if streaming is requested
     is_streaming = data.get("stream", False)
-    print(f"Streaming: {is_streaming}, Model: {data.get('model', 'unknown')}")
+    model = data.get('model', 'unknown')
+    log_request(f"Request details:")
+    log_request(f"  - Streaming: {is_streaming}")
+    log_request(f"  - Model: {model}")
+    log_request(f"  - Messages count: {len(data.get('messages', []))}")
     
     headers = {
         "Authorization": f"Bearer {MINIMAX_API_KEY}",
@@ -152,6 +176,8 @@ async def proxy_minimax(request: Request):
     else:
         headers["Accept"] = "application/json"
     
+    log_request(f"Calling MiniMax API: {MINIMAX_API_URL}")
+    
     # Remove problematic parameters that might cause issues
     problem_params = ["thinking", "reasoning", "reasoning_level", "extra_params"]
     for param in problem_params:
@@ -161,21 +187,23 @@ async def proxy_minimax(request: Request):
     try:
         async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
             response = await client.post(
-                "https://api.minimax.io/v1/chat/completions",
+                MINIMAX_API_URL,
                 json=data,
                 headers=headers,
                 follow_redirects=True
             )
             
-            print(f"Minimax API response status: {response.status_code}")
+            log_request(f"Minimax API response status: {response.status_code}")
+            log_request(f"Response headers: {dict(response.headers)}")
             
             if is_streaming:
+                log_request("Returning streaming response")
                 return StreamingResponse(
                     stream_minimax_response(response),
                     media_type="text/event-stream"
                 )
             else:
-                # Handle non-streaming responses
+                log_request("Processing non-streaming response")
                 result = response.json()
                 
                 if 'choices' in result and len(result['choices']) > 0:
@@ -191,12 +219,13 @@ async def proxy_minimax(request: Request):
                     # Handle reasoning_details in non-streaming
                     reasoning_details = message.get('reasoning_details', [])
                     if reasoning_details and isinstance(reasoning_details, list):
-                        # Keep reasoning separate, don't merge into content
-                        pass
+                        log_request(f"Reasoning details found: {len(reasoning_details)} blocks")
                 
                 return result
     except Exception as e:
-        print(f"Error proxying request: {e}")
+        log_request(f"ERROR: {str(e)}")
+        import traceback
+        log_request(f"Traceback: {traceback.format_exc()}")
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
@@ -205,17 +234,25 @@ async def proxy_minimax(request: Request):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "minimax_proxy"}
+    log_request("Health check endpoint called")
+    return {"status": "healthy", "service": "minimax_proxy", "timestamp": str(datetime.now())}
 
 
 @app.get("/")
 async def root():
+    log_request("Root endpoint called")
     return {
         "message": "Minimax Token Plan Proxy",
         "endpoints": {
             "POST /v1/chat/completions": "Proxy to Minimax API",
             "GET /health": "Health check",
-            "GET /": "This info page"
+            "GET /": "This info page",
+            "GET /test": "Test endpoint"
+        },
+        "config": {
+            "api_url": MINIMAX_API_URL,
+            "api_key_configured": MINIMAX_API_KEY != "sk-cp-xxxxxxxxxxxx",
+            "timeout": PROXY_TIMEOUT
         }
     }
 
@@ -223,13 +260,19 @@ async def root():
 @app.get("/test")
 async def test_endpoint():
     """Test endpoint to verify proxy is working"""
+    log_request("Test endpoint called")
     return {
         "status": "ok",
         "message": "Proxy is accessible",
-        "api_key_configured": MINIMAX_API_KEY != "sk-cp-xxxxxxxxxxxx"
+        "timestamp": str(datetime.now()),
+        "config": {
+            "api_url": MINIMAX_API_URL,
+            "api_key_configured": MINIMAX_API_KEY != "sk-cp-xxxxxxxxxxxx"
+        }
     }
 
 
 if __name__ == "__main__":
     import uvicorn
+    log_request("Starting uvicorn server on 0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
