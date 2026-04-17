@@ -1,9 +1,16 @@
-# Dockerfile - Minimal setup for Zeabur
+# Dockerfile - Minimax Token Plan Proxy using mmx-cli
 FROM python:3.11-slim
+
+# Install Node.js for mmx-cli
+RUN apt-get update && apt-get install -y curl \
+    && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
+    && apt-get install -y nodejs \
+    && apt-get clean \
+    && npm install -g mmx-cli
 
 WORKDIR /app
 
-# Install dependencies
+# Copy Python requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
