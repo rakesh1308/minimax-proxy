@@ -1,11 +1,12 @@
-# minimax_proxy.py - Minimax Token Plan Proxy with proper SSE streaming
+# minimax_proxy.py - Minimax Token Plan Proxy using mmx-cli with proper streaming
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-import re
+import subprocess
 import json
 import os
+import asyncio
+import sys
 from datetime import datetime
 
 app = FastAPI()
@@ -21,16 +22,14 @@ app.add_middleware(
 
 # Configuration
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "sk-cp-xxxxxxxxxxxx")
-MINIMAX_API_BASE = os.getenv("MINIMAX_API_BASE", "https://api.minimax.io")
 PROXY_TIMEOUT = 120.0
 
-print(f"[{datetime.now()}] MiniMax Proxy starting...")
+print(f"[{datetime.now()}] MiniMax Proxy starting (using mmx-cli)...")
 print(f"[{datetime.now()}] API Key configured: {MINIMAX_API_KEY != 'sk-cp-xxxxxxxxxxxx'}")
-print(f"[{datetime.now()}] API Base: {MINIMAX_API_BASE}")
 
 
 def log(msg: str):
-    print(f"[{datetime.now()}] {msg}")
+    print(f"[{datetime.now()}] {msg}", flush=True)
 
 
 def clean_content(content: str) -> str:
@@ -38,99 +37,150 @@ def clean_content(content: str) -> str:
     if not content:
         return content
     result = content
-    # Remove <think>... tags
-    result = re.sub(r'<think>[\s\S]*?', '', result)
+    result = content.replace('<think>', '').replace('', '')
     return result.strip()
 
 
-async def stream_minimax_response(response: httpx.Response, model: str):
-    """Stream MiniMax response with proper SSE handling"""
-    log("Starting SSE stream handler")
-    buffer = ""
-    chunk_count = 0
+async def stream_from_process(process, model):
+    """Stream output from mmx-cli process in real-time"""
+    log("Starting real-time stream from mmx-cli")
     
-    async for chunk in response.aiter_bytes():
-        if not chunk:
-            continue
-        
-        try:
-            chunk_str = chunk.decode('utf-8', errors='replace')
-        except Exception as e:
-            log(f"Decode error: {e}")
-            continue
-        
-        buffer += chunk_str
-        chunk_count += 1
-        
-        # Process complete SSE lines
-        while '\n' in buffer:
-            line_end = buffer.find('\n')
-            line = buffer[:line_end].strip()
-            buffer = buffer[line_end + 1:]
-            
+    try:
+        # Read stdout line by line as they come
+        while True:
+            line = await process.stdout.readline()
             if not line:
+                # Check if process has exited
+                if process.returncode is not None:
+                    break
+                await asyncio.sleep(0.01)
                 continue
             
-            if line.startswith('data: '):
-                data_str = line[6:].strip()
-                
-                if data_str == '[DONE]':
-                    log(f"Stream done. Total chunks: {chunk_count}")
-                    yield b'data: [DONE]\n\n'
-                    continue
-                
+            line_str = line.decode('utf-8', errors='replace').strip()
+            if not line_str:
+                continue
+            
+            log(f"mmx output: {line_str[:200]}...")
+            
+            # Parse JSON line
+            if line_str.startswith('{'):
                 try:
-                    data = json.loads(data_str)
+                    data = json.loads(line_str)
                     
-                    if 'choices' in data and len(data['choices']) > 0:
-                        choice = data['choices'][0]
-                        delta = choice.get('delta', {})
-                        
-                        # Handle reasoning_content (MiniMax thinking in OpenAI format)
-                        reasoning_content = delta.get('reasoning_content', '')
-                        if reasoning_content:
-                            reasoning_data = {
-                                "id": data.get("id", f"chatcmpl-{os.urandom(8).hex()}"),
+                    # Check for content in various fields
+                    content = (data.get('content') or data.get('text') or 
+                              data.get('message', {}).get('content', ''))
+                    reasoning = (data.get('reasoning_content') or data.get('thinking') or
+                               data.get('reasoning') or data.get('message', {}).get('reasoning_content', ''))
+                    
+                    chunk_id = data.get('id', f"chatcmpl-{os.urandom(8).hex()}")
+                    created = data.get('created', int(datetime.now().timestamp()))
+                    
+                    # Yield reasoning as thinking
+                    if reasoning:
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": f"[Thinking] {reasoning}"},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n".encode()
+                    
+                    # Yield content
+                    if content:
+                        cleaned = clean_content(content)
+                        if cleaned:
+                            chunk = {
+                                "id": chunk_id,
                                 "object": "chat.completion.chunk",
-                                "created": data.get("created", int(datetime.now().timestamp())),
+                                "created": created,
                                 "model": model,
                                 "choices": [{
                                     "index": 0,
-                                    "delta": {"content": f"[Thinking] {reasoning_content}"},
+                                    "delta": {"content": cleaned},
                                     "finish_reason": None
                                 }]
                             }
-                            yield f'data: {json.dumps(reasoning_data, ensure_ascii=False)}\n\n'.encode()
-                        
-                        # Handle regular content
-                        content = delta.get('content', '')
-                        if content:
-                            cleaned = clean_content(content)
-                            if cleaned:
-                                delta['content'] = cleaned
-                                yield f'data: {json.dumps(data, ensure_ascii=False)}\n\n'.encode()
-                                continue
-                        
-                        # If no content after cleaning, pass through
-                        if not reasoning_content:
-                            yield f'data: {data_str}\n\n'.encode()
-                    else:
-                        # Pass through usage/stats data
-                        yield f'data: {data_str}\n\n'.encode()
-                        
+                            yield f"data: {json.dumps(chunk)}\n\n".encode()
+                            
                 except json.JSONDecodeError:
-                    yield f'data: {data_str}\n\n'.encode()
-    
-    # Handle remaining buffer
-    if buffer.strip():
-        if buffer.strip().startswith('data: '):
-            yield f'{buffer.strip()}\n\n'.encode()
+                    # Not JSON, might be plain text
+                    if line_str and not line_str.startswith('data:'):
+                        cleaned = clean_content(line_str)
+                        if cleaned:
+                            chunk = {
+                                "id": f"chatcmpl-{os.urandom(8).hex()}",
+                                "object": "chat.completion.chunk",
+                                "created": int(datetime.now().timestamp()),
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": cleaned},
+                                    "finish_reason": None
+                                }]
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n".encode()
+            elif line_str and not line_str.startswith('data:'):
+                # Plain text line
+                cleaned = clean_content(line_str)
+                if cleaned:
+                    chunk = {
+                        "id": f"chatcmpl-{os.urandom(8).hex()}",
+                        "object": "chat.completion.chunk",
+                        "created": int(datetime.now().timestamp()),
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": cleaned},
+                            "finish_reason": None
+                        }]
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+        
+        # Process finished, wait for any remaining output
+        await process.wait()
+        
+        # Send final chunk
+        final_chunk = {
+            "id": f"chatcmpl-{os.urandom(8).hex()}",
+            "object": "chat.completion.chunk",
+            "created": int(datetime.now().timestamp()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }
+        yield f"data: {json.dumps(final_chunk)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+        
+    except Exception as e:
+        log(f"Stream error: {e}")
+        import traceback
+        log(f"Traceback: {traceback.format_exc()}")
+        yield b"data: [DONE]\n\n"
+
+
+async def read_stderr(process):
+    """Read stderr (reasoning logs) from mmx-cli"""
+    try:
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                break
+            line_str = line.decode('utf-8', errors='replace').strip()
+            if line_str:
+                log(f"mmx reasoning stderr: {line_str[:200]}...")
+    except Exception as e:
+        log(f"Stderr read error: {e}")
 
 
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def proxy_minimax(request: Request):
-    """Proxy requests to MiniMax API"""
+    """Proxy requests to MiniMax via mmx-cli"""
     log("=" * 50)
     log("RECEIVED REQUEST")
     
@@ -140,48 +190,137 @@ async def proxy_minimax(request: Request):
     
     log(f"Stream: {is_streaming}, Model: {model}")
     
-    headers = {
-        "Authorization": f"Bearer {MINIMAX_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream" if is_streaming else "application/json"
-    }
+    # Extract messages
+    messages = data.get('messages', [])
     
-    # Remove problematic params
-    for param in ["thinking", "reasoning", "reasoning_level", "extra_params"]:
-        if param in data:
-            del data[param]
+    if not messages:
+        return JSONResponse(status_code=400, content={"error": "No messages provided"})
+    
+    # Get messages
+    user_message = ""
+    system_message = ""
+    
+    for msg in messages:
+        role = msg.get('role', '')
+        content = msg.get('content', '')
+        if isinstance(content, list):
+            content = ' '.join([c.get('text', '') for c in content if isinstance(c, dict)])
+        
+        if role == 'system':
+            system_message = content
+        elif role == 'user':
+            user_message = content
+    
+    if not user_message:
+        return JSONResponse(status_code=400, content={"error": "No user message found"})
+    
+    log(f"User message: {user_message[:100]}...")
+    
+    # Build mmx command
+    model_suffix = model.replace("MiniMax-", "")
+    
+    # Build command - use --stream for streaming output
+    cmd = ["mmx", "text", "chat", 
+           "--message", user_message, 
+           "--model", model_suffix]
+    
+    # Add --stream flag for streaming
+    if is_streaming:
+        cmd.append("--stream")
+    
+    if system_message:
+        cmd.extend(["--system", system_message])
+    
+    log(f"Running: {' '.join(cmd)}")
     
     try:
-        async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
-            response = await client.post(
-                f"{MINIMAX_API_BASE}/v1/chat/completions",
-                json=data,
-                headers=headers,
-                follow_redirects=True
-            )
+        # Set environment with API key
+        env = os.environ.copy()
+        env["MINIMAX_API_KEY"] = MINIMAX_API_KEY
+        
+        # Start process
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env
+        )
+        
+        log(f"Process started with PID: {process.pid}")
+        
+        if is_streaming:
+            # Start stderr reader task
+            stderr_task = asyncio.create_task(read_stderr(process))
             
-            log(f"Minimax response status: {response.status_code}")
+            async def generate():
+                async for chunk in stream_from_process(process, model):
+                    yield chunk
+                await stderr_task
             
-            if is_streaming:
-                return StreamingResponse(
-                    stream_minimax_response(response, model),
-                    media_type="text/event-stream"
-                )
-            else:
-                result = response.json()
-                
-                if 'choices' in result and len(result['choices']) > 0:
-                    message = result['choices'][0].get('message', {})
-                    content = message.get('content', '')
-                    
-                    if content:
-                        cleaned = clean_content(content)
-                        if cleaned != content:
-                            message['content'] = cleaned
-                            result['choices'][0]['message'] = message
-                
-                return result
-                
+            return StreamingResponse(generate(), media_type="text/event-stream")
+        else:
+            # Non-streaming: collect all output
+            stdout_lines = []
+            stderr_lines = []
+            
+            # Read stdout
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                stdout_lines.append(line.decode('utf-8', errors='replace').strip())
+            
+            # Read stderr
+            while True:
+                line = await process.stderr.readline()
+                if not line:
+                    break
+                stderr_lines.append(line.decode('utf-8', errors='replace').strip())
+            
+            await process.wait()
+            
+            # Log stderr
+            for line in stderr_lines:
+                if line:
+                    log(f"mmx stderr: {line[:200]}...")
+            
+            # Parse response
+            full_content = ""
+            for line in stdout_lines:
+                if line.startswith('{'):
+                    try:
+                        data = json.loads(line)
+                        content = (data.get('content') or data.get('text') or
+                                 data.get('message', {}).get('content', ''))
+                        if content:
+                            full_content += content
+                    except:
+                        pass
+                else:
+                    full_content += line + "\n"
+            
+            result = {
+                "id": f"chatcmpl-{os.urandom(12).hex()}",
+                "object": "chat.completion",
+                "created": int(datetime.now().timestamp()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": clean_content(full_content)
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0
+                }
+            }
+            
+            return result
+            
     except Exception as e:
         log(f"ERROR: {e}")
         import traceback
@@ -192,16 +331,16 @@ async def proxy_minimax(request: Request):
 @app.get("/health")
 async def health_check():
     log("Health check called")
-    return {"status": "healthy", "service": "minimax_proxy"}
+    return {"status": "healthy", "service": "minimax_proxy", "using": "mmx-cli"}
 
 
 @app.get("/")
 async def root():
     log("Root endpoint called")
     return {
-        "message": "MiniMax Token Plan Proxy",
+        "message": "MiniMax Token Plan Proxy (using mmx-cli)",
         "endpoints": {
-            "POST /v1/chat/completions": "Proxy to MiniMax API",
+            "POST /v1/chat/completions": "Proxy to MiniMax via mmx-cli",
             "POST /chat/completions": "Alias for /v1/chat/completions",
             "GET /health": "Health check"
         }
@@ -214,7 +353,8 @@ async def test_endpoint():
     return {
         "status": "ok",
         "message": "Proxy is accessible",
-        "api_configured": MINIMAX_API_KEY != "sk-cp-xxxxxxxxxxxx"
+        "using": "mmx-cli",
+        "api_key_configured": MINIMAX_API_KEY != "sk-cp-xxxxxxxxxxxx"
     }
 
 
