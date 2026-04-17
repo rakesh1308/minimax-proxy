@@ -1,6 +1,6 @@
 # minimax_proxy.py - Minimax Token Plan Proxy using mmx-cli for reliable streaming
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import json
@@ -42,6 +42,7 @@ def clean_content(content: str) -> str:
 
 
 @app.post("/v1/chat/completions")
+@app.post("/chat/completions")
 async def proxy_minimax(request: Request):
     """Proxy requests to MiniMax via mmx-cli"""
     log("=" * 50)
@@ -80,7 +81,9 @@ async def proxy_minimax(request: Request):
     log(f"User message: {user_message[:100]}...")
     
     # Build mmx command
-    cmd = ["mmx", "text", "chat", "--message", user_message, "--model", model.replace("MiniMax-", ""), "--stream"]
+    # Map model names: MiniMax-M2.7 -> M2.7, MiniMax-M2.5 -> M2.5, etc.
+    model_suffix = model.replace("MiniMax-", "")
+    cmd = ["mmx", "text", "chat", "--message", user_message, "--model", model_suffix, "--stream"]
     
     if system_message:
         cmd.extend(["--system", system_message])
@@ -253,6 +256,7 @@ async def root():
         "message": "MiniMax Token Plan Proxy (using mmx-cli)",
         "endpoints": {
             "POST /v1/chat/completions": "Proxy to MiniMax via mmx-cli",
+            "POST /chat/completions": "Alias for /v1/chat/completions",
             "GET /health": "Health check"
         }
     }
